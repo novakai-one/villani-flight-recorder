@@ -8,7 +8,7 @@ Last updated: 2026-07-04.
 - Fork: `novakai-one/villani-flight-recorder` (origin). Upstream: `mmprotest/villani-flight-recorder`.
 - PR #1 (cost estimation + subagent rollup in the session browser) — merged 2026-07-03.
 - PR #2 (replay/browser stat reconciliation — the commit adding this file) — merged 2026-07-04.
-- PR #3 (`vfr analyze` — fleet cost-driver report + per-session inefficiency deep dive, `src/analyze/analyze.ts`) — this commit. Fleet view is index-only; `--id` re-parses one transcript. Verified against the real index: fleet totals reconcile exactly with summed session records, and `--id` cost matches the stored `costUsd` to the digit. Heuristic thresholds are named constants at the top of `analyze.ts`, eyeballed — tune from real fleets.
+- `vfr analyze` (fleet cost-driver report + per-session inefficiency deep dive, `src/analyze/analyze.ts`) — merged directly to main 2026-07-04, no PR (a PR was mistakenly opened against upstream as mmprotest#27 and closed unmerged). Fleet view is index-only; `--id` re-parses one transcript. Verified against the real index: fleet totals reconcile exactly with summed session records, and `--id` cost matches the stored `costUsd` to the digit. Heuristic thresholds are named constants at the top of `analyze.ts`, eyeballed — tune from real fleets.
 - Test suite: vitest, 81 tests across 20 files, all green as of this commit. Gates: `npm run typecheck`, `npm test`, `npm run build`.
 - `dist/` is committed. Always run `npm run build` before committing; the `vfr` CLI executes `dist/cli.js`, not `src/`.
 
