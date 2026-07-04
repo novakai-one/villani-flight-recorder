@@ -1,13 +1,16 @@
-import { estimateCost, matchModelRates } from "../render/pricing.js";
+import { estimateCost, matchModelRates, MODEL_RATES, } from "../render/pricing.js";
 import { isSubagentTranscript } from "../index/subagents.js";
 // ponytail: eyeballed thresholds, tune from real fleets
 export const CACHE_HIT_FLOOR_TOKENS = 1_000_000;
 export const CACHE_HIT_MIN_RATIO = 0.8;
 export const OUTPUT_COST_SHARE_MAX = 0.4;
+// Output-share flags only matter on sessions expensive enough to care about.
+export const OUTPUT_COST_FLAG_MIN_USD = 5;
 export const CONCENTRATION_TOP_N = 5;
 export const CONCENTRATION_MAX_SHARE = 0.5;
 export const SUBAGENT_MAX_SHARE = 0.3;
 export const CONTEXT_TAIL_TOKENS = 120_000;
+export const TOP_CONTRIBUTIONS = 10;
 export const TOOL_OUTPUT_CHAR_FLAG = 30_000;
 /** cacheRead / (cacheRead + cacheCreation + input), undefined without a split. */
 function recordCacheHitRatio(s) {
@@ -69,7 +72,7 @@ export function analyzeFleet(sessions, opts) {
             costByClass.coveredSessions++;
             const sessionClassUsd = c.inputUsd + c.outputUsd + c.cacheWriteUsd + c.cacheReadUsd;
             const share = sessionClassUsd > 0 ? c.outputUsd / sessionClassUsd : 0;
-            if (share > OUTPUT_COST_SHARE_MAX)
+            if (share > OUTPUT_COST_SHARE_MAX && sessionClassUsd >= OUTPUT_COST_FLAG_MIN_USD)
                 flags.push({
                     kind: "output-cost-share",
                     sessionId: s.id,
@@ -164,6 +167,74 @@ export function analyzeFleet(sessions, opts) {
     };
 }
 const TOOLISH = new Set(["tool_call", "tool_result", "bash_command", "test_run"]);
+/**
+ * Attribute session cost to context contributions. Each API call's
+ * input+cacheCreation tokens are new context, paid once to ingest and then
+ * re-read (at the cache-read rate) by every subsequent call. Assumes cache
+ * hits on the carry; with typical 97%+ hit ratios the error is small.
+ */
+function contextContributions(rec, events) {
+    const out = [];
+    let prev = -1;
+    for (let i = 0; i < events.length; i++) {
+        const u = events[i].tokenUsage;
+        if (!u)
+            continue;
+        let label = events[i].title;
+        let best = 0;
+        for (let j = prev + 1; j < i; j++) {
+            const e = events[j];
+            const chars = (e.stdout?.length ?? 0) + (e.summary?.length ?? 0);
+            if (TOOLISH.has(e.type) && chars > best) {
+                best = chars;
+                label = `${e.type} ${e.title}`;
+            }
+        }
+        const input = u.inputTokens ?? 0;
+        const write = u.cacheCreationTokens ?? 0;
+        const rates = matchModelRates(events[i].model ?? rec.model ?? "")?.rates;
+        out.push({
+            callIndex: out.length,
+            eventIndex: i,
+            label,
+            addedTokens: input + write,
+            callsCarried: 0,
+            ingestUsd: rates
+                ? (input * rates.input + write * rates.cacheWrite) / 1_000_000
+                : undefined,
+            carryUsd: undefined,
+            lifetimeUsd: undefined,
+        });
+        prev = i;
+    }
+    let modeledCarryUsd = 0;
+    let actualReadUsd = 0;
+    for (const c of out) {
+        c.callsCarried = out.length - 1 - c.callIndex;
+        const rates = matchModelRates(events[c.eventIndex].model ?? rec.model ?? "")?.rates;
+        if (rates) {
+            c.carryUsd =
+                (c.addedTokens * rates.cacheRead * c.callsCarried) / 1_000_000;
+            modeledCarryUsd += c.carryUsd;
+            actualReadUsd +=
+                ((events[c.eventIndex].tokenUsage?.cacheReadTokens ?? 0) *
+                    rates.cacheRead) /
+                    1_000_000;
+        }
+    }
+    // Cache-TTL expiry re-writes the same tokens, so the naive carry model
+    // over-counts reads. Scale carry to the session's actual cache-read spend;
+    // Σ lifetime then equals actual context cost exactly.
+    // ponytail: one global scale, per-model scaling if mixed-model drift matters
+    const scale = modeledCarryUsd > 0 ? actualReadUsd / modeledCarryUsd : 0;
+    for (const c of out) {
+        if (c.carryUsd === undefined)
+            continue;
+        c.carryUsd *= scale;
+        c.lifetimeUsd = (c.ingestUsd ?? 0) + c.carryUsd;
+    }
+    return out;
+}
 export function analyzeSession(rec, events) {
     const cost = estimateCost(events);
     let input = 0, cacheCreation = 0, cacheRead = 0;
@@ -187,6 +258,22 @@ export function analyzeSession(rec, events) {
         peakTokens: contexts.length ? Math.max(...contexts) : 0,
         finalTokens: contexts.at(-1),
     };
+    const contributions = contextContributions(rec, events);
+    const totalCalls = contributions.length;
+    const topContributions = [...contributions]
+        .sort((a, b) => (b.lifetimeUsd ?? -1) - (a.lifetimeUsd ?? -1) ||
+        b.addedTokens - a.addedTokens)
+        .slice(0, TOP_CONTRIBUTIONS)
+        .filter((c) => c.addedTokens > 0);
+    // Reconciliation: Σ lifetime over ALL contributions should ≈ the session's
+    // actual context cost (input + cacheWrite + cacheRead; output is generation,
+    // not context). Gap = cache misses the carry model assumed were hits.
+    const contributionsUsd = contributions.reduce((a, c) => a + (c.lifetimeUsd ?? 0), 0);
+    const outputUsd = cost.perModel.reduce((a, m) => {
+        const r = MODEL_RATES[m.model];
+        return a + (r ? (m.tokens.outputTokens * r.output) / 1_000_000 : 0);
+    }, 0);
+    const contextUsd = cost.totalUsd - outputUsd;
     const topToolOutputs = events
         .map((e, i) => ({
         eventIndex: i,
@@ -222,5 +309,17 @@ export function analyzeSession(rec, events) {
                 message: `event #${t.eventIndex} (${t.title}) returned ${t.chars} chars (~${t.approxTokens} tokens)`,
                 value: t.chars,
             });
-    return { id: rec.id, cost, cacheHitRatio, contextCurve, topToolOutputs, flags };
+    return {
+        id: rec.id,
+        cost,
+        cacheHitRatio,
+        contextCurve,
+        totalCalls,
+        topContributions,
+        contributionsUsd,
+        contextUsd,
+        outputUsd,
+        topToolOutputs,
+        flags,
+    };
 }

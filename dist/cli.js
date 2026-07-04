@@ -321,6 +321,13 @@ program
             console.log(`Unpriced models: ${r.cost.unknownModels.join(", ")}`);
         console.log(`Cache hit ratio: ${pct(r.cacheHitRatio)}`);
         console.log(`Context curve: ${r.contextCurve.turns} turns · first ${formatTokenCount(r.contextCurve.firstTokens)} · peak ${formatTokenCount(r.contextCurve.peakTokens)} · final ${formatTokenCount(r.contextCurve.finalTokens)}`);
+        if (r.topContributions.length) {
+            console.log("\nTop context contributions by lifetime cost (ingest + cache reads over remaining calls):");
+            for (const c of r.topContributions)
+                console.log(`- call ${c.callIndex + 1}/${r.totalCalls} (${c.label.replace(/\s+/g, " ").slice(0, 60)}): added ${formatTokenCount(c.addedTokens)} tokens, carried ${c.callsCarried} calls ≈ ${c.lifetimeUsd === undefined ? "unpriced" : formatUsd(c.lifetimeUsd)}`);
+            const covered = r.contextUsd > 0 ? Math.round((r.contributionsUsd / r.contextUsd) * 100) : 0;
+            console.log(`All ${r.totalCalls} contributions sum to ${formatUsd(r.contributionsUsd)} vs actual context cost ${formatUsd(r.contextUsd)} (${covered}% reconciled); output ${formatUsd(r.outputUsd)} → session total ${formatUsd(r.cost.totalUsd)}`);
+        }
         if (r.topToolOutputs.length) {
             console.log("\nTop tool outputs:");
             for (const t of r.topToolOutputs)

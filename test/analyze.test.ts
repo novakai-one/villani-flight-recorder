@@ -103,6 +103,23 @@ describe("analyzeFleet", () => {
     expect(r.topProjects[0].costUsd).toBeCloseTo(6, 6);
   });
 
+  it("only flags output-heavy sessions above the cost floor", () => {
+    const tiny = rec({
+      id: "tiny",
+      model: "claude-sonnet-5",
+      outputTokenCount: 50_000, // $0.50 of output, 100% share — noise
+    });
+    const big = rec({
+      id: "big",
+      model: "claude-sonnet-5",
+      outputTokenCount: 1_000_000, // $10 of output, 100% share
+    });
+    const r = analyzeFleet([tiny, big]);
+    const shareFlags = r.flags.filter((f) => f.kind === "output-cost-share");
+    expect(shareFlags).toHaveLength(1);
+    expect(shareFlags[0].sessionId).toBe("big");
+  });
+
   it("flags low cache-hit ratio only above the context-token floor", () => {
     const big = rec({
       id: "big",
@@ -157,5 +174,46 @@ describe("analyzeSession", () => {
     expect(
       r.flags.some((f) => f.kind === "large-tool-output" && f.value === 40_000),
     ).toBe(true);
+  });
+
+  it("attributes lifetime cost to context contributions", () => {
+    const usage = (u: TokenUsage) => ({
+      model: "claude-sonnet-5",
+      tokenUsage: u,
+    });
+    const events: FlightEvent[] = [
+      ev(usage({ inputTokens: 1_000, outputTokens: 200 })),
+      ev({
+        type: "tool_result",
+        title: "Read big file",
+        stdout: "x".repeat(40_000),
+      }),
+      // call 2 ingests the big read: 10k cache-write tokens
+      ev(
+        usage({
+          inputTokens: 0,
+          cacheCreationTokens: 10_000,
+          cacheReadTokens: 1_000,
+          outputTokens: 300,
+        }),
+      ),
+      ev(usage({ inputTokens: 0, cacheReadTokens: 11_000, outputTokens: 100 })),
+      ev(usage({ inputTokens: 0, cacheReadTokens: 11_000, outputTokens: 100 })),
+    ];
+    const r = analyzeSession(rec({ id: "s2" }), events);
+    expect(r.totalCalls).toBe(4);
+    const top = r.topContributions[0];
+    // sonnet-5: cacheWrite 2.5, cacheRead 0.2 per MTok. Actual reads (23k)
+    // equal modeled carry here, so scale is 1:
+    // ingest 10k * 2.5/M = 0.025; carry 10k * 0.2/M * 2 calls = 0.004
+    expect(top).toMatchObject({
+      callIndex: 1,
+      label: "tool_result Read big file",
+      addedTokens: 10_000,
+      callsCarried: 2,
+    });
+    expect(top.lifetimeUsd).toBeCloseTo(0.029, 6);
+    // full attribution reconciles with actual context cost
+    expect(r.contributionsUsd).toBeCloseTo(r.contextUsd, 10);
   });
 });
