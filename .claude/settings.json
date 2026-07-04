@@ -1,0 +1,8 @@
+{
+    "permissions": {
+      "allow": [
+        "Bash(gh pr create --repo novakai-one/villani-flight-recorder:*)",
+        "Bash(gh pr merge --repo novakai-one/villani-flight-recorder:*)"
+      ]
+    }
+  }
