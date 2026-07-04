@@ -14,6 +14,8 @@ import { scanToIndex } from "./index/sessionIndex.js";
 import { readIndex, defaultIndexDir } from "./index/sessionStore.js";
 import { renderSessionBrowser } from "./render/sessionBrowser.js";
 import { formatTokenCount } from "./providers/helpers/tokens.js";
+import { formatUsd, shortModelName } from "./render/pricing.js";
+import { analyzeFleet, analyzeSession } from "./analyze/analyze.js";
 import { adaptersFor } from "./providers/providerAdapter.js";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -281,6 +283,89 @@ program
         const repo = idx.repos.find((r) => t.repoIds.includes(r.id));
         console.log(`${i + 1}. ${t.id}\n   Title: ${t.title}\n   Agent: ${t.provider}\n   Repo: ${repo?.name ?? "Task unavailable"}\n   Events: ${t.eventCount}\n   Failed commands: ${t.failedCommandCount}\n   Boundary: ${t.boundaryReason}\n   Time: ${t.firstEventAt ?? "Duration unavailable"} to ${t.lastEventAt ?? "Duration unavailable"}\n`);
     });
+});
+program
+    .command("analyze")
+    .description("Fleet cost drivers from the session index, or a per-session inefficiency report with --id.")
+    .option("--id <session-id>")
+    .option("--project <name>")
+    .option("--limit <n>")
+    .option("--json")
+    .option("--index-dir <path>")
+    .action(async (o) => {
+    const idx = await requireIndex(o.indexDir);
+    if (!idx)
+        return;
+    const pct = (r) => r === undefined ? "—" : `${Math.round(r * 100)}%`;
+    if (o.id) {
+        const rec = idx.sessions.find((s) => s.id === o.id);
+        if (!rec)
+            throw new Error("analyze --id did not match any indexed session. Run: vfr sessions");
+        const ad = adaptersFor(String(rec.provider))[0];
+        const parsed = await ad.parse({
+            provider: rec.provider,
+            sourcePath: rec.sourcePath,
+            sourceKind: "file",
+            confidence: rec.confidence,
+            reason: "session analysis",
+        });
+        const r = analyzeSession(rec, parsed.events);
+        if (o.json)
+            return console.log(JSON.stringify(r, null, 2));
+        console.log(`Session ${r.id}\n`);
+        console.log("Model             Input    Output   CacheW   CacheR   Cost");
+        for (const m of r.cost.perModel)
+            console.log(`${shortModelName(m.model).padEnd(17)} ${formatTokenCount(m.tokens.inputTokens).padEnd(8)} ${formatTokenCount(m.tokens.outputTokens).padEnd(8)} ${formatTokenCount(m.tokens.cacheCreationTokens).padEnd(8)} ${formatTokenCount(m.tokens.cacheReadTokens).padEnd(8)} ${formatUsd(m.usd)}`);
+        console.log(`Total estimated cost: ${formatUsd(r.cost.totalUsd)}`);
+        if (r.cost.unknownModels.length)
+            console.log(`Unpriced models: ${r.cost.unknownModels.join(", ")}`);
+        console.log(`Cache hit ratio: ${pct(r.cacheHitRatio)}`);
+        console.log(`Context curve: ${r.contextCurve.turns} turns · first ${formatTokenCount(r.contextCurve.firstTokens)} · peak ${formatTokenCount(r.contextCurve.peakTokens)} · final ${formatTokenCount(r.contextCurve.finalTokens)}`);
+        if (r.topToolOutputs.length) {
+            console.log("\nTop tool outputs:");
+            for (const t of r.topToolOutputs)
+                console.log(`- #${t.eventIndex} ${t.type} ${t.title.replace(/\s+/g, " ").slice(0, 60)} — ${t.chars} chars (~${formatTokenCount(t.approxTokens)} tokens)`);
+        }
+        if (r.flags.length) {
+            console.log("\nFlags:");
+            for (const f of r.flags)
+                console.log(`- ${f.message}`);
+        }
+        return;
+    }
+    const rows = idx.sessions.filter((s) => projectMatches(s, o.project));
+    const r = analyzeFleet(rows, {
+        top: o.limit ? Number(o.limit) : undefined,
+    });
+    if (o.json)
+        return console.log(JSON.stringify(r, null, 2));
+    if (!rows.length)
+        return console.log("No sessions indexed yet. Run `vfr scan` to index local agent sessions.");
+    console.log("Fleet cost analysis\n");
+    console.log(`Sessions: ${r.totals.sessions} (${r.totals.pricedSessions} priced, ${r.totals.unpricedSessions} unpriced)`);
+    console.log(`Total estimated cost: ${formatUsd(r.totals.totalCostUsd)}`);
+    console.log(`Tokens: input ${formatTokenCount(r.totals.tokens.input)} · output ${formatTokenCount(r.totals.tokens.output)} · cache write ${formatTokenCount(r.totals.tokens.cacheCreation)} · cache read ${formatTokenCount(r.totals.tokens.cacheRead)}`);
+    if (r.costByClass)
+        console.log(`Cost by class (approx, ${r.costByClass.coveredSessions} sessions): input ${formatUsd(r.costByClass.inputUsd)} · output ${formatUsd(r.costByClass.outputUsd)} · cache write ${formatUsd(r.costByClass.cacheWriteUsd)} · cache read ${formatUsd(r.costByClass.cacheReadUsd)}`);
+    console.log("\nTop sessions by cost");
+    console.log("ID                 Project              Cost     CacheHit  Tokens   Model");
+    for (const s of r.topSessions)
+        console.log(`${s.id.padEnd(18)} ${s.project.slice(0, 20).padEnd(20)} ${(s.unpriced ? "—" : formatUsd(s.costUsd ?? 0)).padEnd(8)} ${pct(s.cacheHitRatio).padEnd(9)} ${formatTokenCount(s.tokenCount).padEnd(8)} ${s.model ? shortModelName(s.model) : "-"}`);
+    console.log("\nTop projects by cost");
+    console.log("Project              Sessions  Cost     Tokens");
+    for (const p of r.topProjects)
+        console.log(`${p.project.slice(0, 20).padEnd(20)} ${String(p.sessions).padEnd(9)} ${formatUsd(p.costUsd).padEnd(8)} ${formatTokenCount(p.tokenCount)}`);
+    console.log(`\nTop ${r.concentration.topN} sessions carry ${pct(r.concentration.shareOfTotal)} of fleet cost.`);
+    console.log(`Subagents: ${r.subagents.sessionCount} sessions, ${formatUsd(r.subagents.costUsd)} (${pct(r.subagents.shareOfTotal)} of fleet cost).`);
+    if (r.flags.length) {
+        console.log("\nFlags:");
+        for (const f of r.flags)
+            console.log(`- ${f.message}`);
+    }
+    if (r.totals.missingCacheSplit > 0)
+        console.log(`\n${r.totals.missingCacheSplit} sessions lack a cache read/write split. Run: vfr scan --rebuild`);
+    if (r.totals.unpricedSessions > 0)
+        console.log(`${r.totals.unpricedSessions} sessions (codex/pi/unknown) unpriced: ${formatTokenCount(r.totals.unpricedTokenCount)} tokens.`);
 });
 program
     .command("browse")

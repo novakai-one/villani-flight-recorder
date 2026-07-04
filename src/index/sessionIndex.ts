@@ -340,6 +340,8 @@ export async function scanToIndex(opts: {
                 (tokenUsage.cacheReadTokens ?? 0) +
                 (tokenUsage.cachedTokens ?? 0)
               : undefined,
+          cacheCreationTokenCount: tokenUsage?.cacheCreationTokens,
+          cacheReadTokenCount: tokenUsage?.cacheReadTokens,
           reasoningTokenCount: tokenUsage?.reasoningTokens,
           costUsd: costEstimate.perModel.length
             ? costEstimate.totalUsd

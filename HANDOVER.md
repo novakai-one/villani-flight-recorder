@@ -7,8 +7,9 @@ Last updated: 2026-07-04.
 
 - Fork: `novakai-one/villani-flight-recorder` (origin). Upstream: `mmprotest/villani-flight-recorder`.
 - PR #1 (cost estimation + subagent rollup in the session browser) — merged 2026-07-03.
-- PR #2 (replay/browser stat reconciliation — the commit adding this file) — see below.
-- Test suite: vitest, 78 tests across 19 files, all green as of this commit. Gates: `npm run typecheck`, `npm test`, `npm run build`.
+- PR #2 (replay/browser stat reconciliation — the commit adding this file) — merged 2026-07-04.
+- PR #3 (`vfr analyze` — fleet cost-driver report + per-session inefficiency deep dive, `src/analyze/analyze.ts`) — this commit. Fleet view is index-only; `--id` re-parses one transcript. Verified against the real index: fleet totals reconcile exactly with summed session records, and `--id` cost matches the stored `costUsd` to the digit. Heuristic thresholds are named constants at the top of `analyze.ts`, eyeballed — tune from real fleets.
+- Test suite: vitest, 81 tests across 20 files, all green as of this commit. Gates: `npm run typecheck`, `npm test`, `npm run build`.
 - `dist/` is committed. Always run `npm run build` before committing; the `vfr` CLI executes `dist/cli.js`, not `src/`.
 
 ## Token/cost architecture — single source of truth
@@ -16,6 +17,7 @@ Last updated: 2026-07-04.
 The scan pipeline is authoritative for token/cost numbers:
 
 - `vfr scan` parses transcripts and stores `tokenCount` / `inputTokenCount` / `outputTokenCount` / `cacheTokenCount` / `costUsd` on each index record (`src/index/sessionIndex.ts`).
+- `SessionRecord` also stores the cache split as `cacheCreationTokenCount` / `cacheReadTokenCount` (used by `vfr analyze`); pre-existing index entries need `vfr scan --rebuild` to backfill them.
 - The session browser reads those stored fields and adds a subagent roll-up via `subagentRollup()` in `src/index/subagents.ts`.
 - The replay renderer receives the same stored stats as `IndexSessionStats`, threaded `cli.ts → renderReplay → renderDashboard → deriveReplayViewModel → deriveMetrics`. The live `sumTokenUsage`/`estimateCost` recompute is a **fallback only** (used when index fields are undefined, and for `--segment`/sliced replays where whole-session totals would misreport).
 
@@ -35,3 +37,4 @@ Do not reintroduce independent recomputation in a render path. That was the orig
 - Replace the render-time git diff in replays with a session-scoped diff (or label it honestly as "current working tree", or drop the tab). See gotcha 4.
 - Segment replays deliberately skip index stats and recompute live; if segment-level accuracy matters, consider per-segment token attribution at scan time.
 - The scan reports ~120k "recorder warnings" across 315 sessions — never triaged.
+- `vfr analyze` cuts made for scope (add only if asked): per-segment cost attribution, tool-output→next-turn cache-write correlation, Codex/Pi pricing (their parsers don't set per-event `model`; sessions show tokens but are flagged unpriced), any HTML/browser surface for the analysis.
